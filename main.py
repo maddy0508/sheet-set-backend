@@ -51,14 +51,16 @@ class RoofResponse(BaseModel):
 class RoofEngine:
     def __init__(self, exterior_2d, interiors_2d=None, pitch_deg=30.0, 
                  sheet_width_mm=760.0, max_stock_mm=12000.0, overhang_mm=150.0):
-        self.ext_2d = self._clean_ring(exterior_2d)
+        # Enforce CCW winding for exterior before doing anything else
+        self.ext_2d = self._ensure_ccw(self._clean_ring(exterior_2d))
         if len(self.ext_2d) < 3:
             raise ValueError("Exterior must have at least 3 distinct points.")
             
         self.int_2d_list = []
         if interiors_2d:
             for interior in interiors_2d:
-                cleaned = self._clean_ring(interior)
+                # Enforce CW winding for interiors
+                cleaned = self._ensure_cw(self._clean_ring(interior))
                 if len(cleaned) >= 3:
                     self.int_2d_list.append(cleaned)
         
@@ -80,6 +82,22 @@ class RoofEngine:
         if len(cleaned) > 1 and math.dist(cleaned[0], cleaned[-1]) < EPS:
             cleaned.pop()
         return cleaned
+
+    def _ensure_ccw(self, ring):
+        """Ensure ring is counter-clockwise. Returns reversed ring if needed."""
+        area2 = sum(
+            ring[i][0] * ring[(i+1) % len(ring)][1] - ring[(i+1) % len(ring)][0] * ring[i][1]
+            for i in range(len(ring))
+        )
+        return ring if area2 > 0 else ring[::-1]
+
+    def _ensure_cw(self, ring):
+        """Ensure ring is clockwise. Returns reversed ring if needed."""
+        area2 = sum(
+            ring[i][0] * ring[(i+1) % len(ring)][1] - ring[(i+1) % len(ring)][0] * ring[i][1]
+            for i in range(len(ring))
+        )
+        return ring if area2 < 0 else ring[::-1]
 
     def run_engine_1_geometry(self):
         ext_3d = [(x, y, 0.0) for x, y in self.ext_2d]
