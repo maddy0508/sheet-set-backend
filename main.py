@@ -41,8 +41,8 @@ class RoofResponse(BaseModel):
     csv_data: str
     sheets: List[SheetData]
     total_faces: int
-    mesh_vertices: List[List[float]]  # <-- NEW: 3D Vertices
-    mesh_faces: List[List[int]]       # <-- NEW: 3D Faces
+    mesh_vertices: List[List[float]]
+    mesh_faces: List[List[int]]
 
 class RoofEngine:
     def __init__(self, exterior_2d, interiors_2d=None, pitch_deg=30.0, 
