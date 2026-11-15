@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Optional
@@ -8,6 +8,11 @@ import shapely.ops
 from shapely.geometry.polygon import orient
 from compas.geometry import Polygon
 from compas_cgal.straight_skeleton_2 import extrude
+import os
+import json
+import tempfile
+from shapely.geometry import Point, shape
+from obe.app import download_buildings
 
 app = FastAPI(title="Sheet Set API", version="1.0.0")
 
@@ -47,6 +52,67 @@ class RoofResponse(BaseModel):
     total_waste_pct: float
     trims: dict
 
+# ==========================================
+# AUTO-OUTLINE ENDPOINT (NEW)
+# ==========================================
+@app.get("/get-footprint")
+async def get_footprint(lat: float = Query(...), lng: float = Query(...)):
+    # Create a small bounding box (approx 50m x 50m) around the tapped point
+    delta = 0.0005
+    bbox = {
+        "type": "FeatureCollection",
+        "features": [{
+            "type": "Feature",
+            "properties": {},
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [[
+                    [lng - delta, lat - delta],
+                    [lng + delta, lat - delta],
+                    [lng + delta, lat + delta],
+                    [lng - delta, lat + delta],
+                    [lng - delta, lat - delta]
+                ]]
+            }
+        }]
+    }
+    
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.geojson', delete=False) as f:
+        json.dump(bbox, f)
+        input_path = f.name
+        
+    output_path = input_path.replace('.geojson', '_out.geojson')
+    
+    try:
+        download_buildings(
+            source="google",
+            input_path=input_path,
+            output_path=output_path,
+            format="geojson"
+        )
+        
+        with open(output_path, 'r') as f:
+            data = json.load(f)
+            
+        pt = Point(lng, lat)
+        for feature in data.get('features', []):
+            poly = shape(feature['geometry'])
+            if poly.contains(pt):
+                # Convert to Leaflet's {lat, lng} format
+                coords = list(poly.exterior.coords)
+                leaflet_coords = [{"lat": c[1], "lng": c[0]} for c in coords]
+                return {"polygon": leaflet_coords}
+                
+        return {"error": "No building found at this location."}
+    except Exception as e:
+        return {"error": str(e)}
+    finally:
+        if os.path.exists(input_path): os.remove(input_path)
+        if os.path.exists(output_path): os.remove(output_path)
+
+# ==========================================
+# ROOF ENGINE CLASS
+# ==========================================
 class RoofEngine:
     def __init__(self, exterior_2d, interiors_2d=None, pitch_deg=30.0, sheet_width_mm=760.0, max_stock_mm=12000.0, overhang_mm=150.0):
         self.ext_2d = self._ensure_ccw(self._clean_ring(exterior_2d))
@@ -92,7 +158,6 @@ class RoofEngine:
         except Exception as e:
             raise ValueError(f"CGAL Skeleton generation failed: {e}")
 
-        # FIXED: Use to_vertices_and_faces() to get the iterables
         verts_raw, faces_raw = mesh.to_vertices_and_faces()
         mesh_verts = [list(v) for v in verts_raw]
         mesh_faces = [list(f) for f in faces_raw]
