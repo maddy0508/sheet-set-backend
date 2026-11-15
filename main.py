@@ -8,11 +8,7 @@ import shapely.ops
 from shapely.geometry.polygon import orient
 from compas.geometry import Polygon
 from compas_cgal.straight_skeleton_2 import extrude
-import os
-import json
-import tempfile
-from shapely.geometry import Point, shape
-from obe.app import download_buildings
+import requests
 
 app = FastAPI(title="Sheet Set API", version="1.0.0")
 
@@ -46,76 +42,54 @@ class RoofResponse(BaseModel):
     csv_data: str
     sheets: List[SheetData]
     total_faces: int
+    total_coils: int           # ADDED
+    total_stock_m: float       # ADDED
     mesh_vertices: List[List[float]]
     mesh_faces: List[List[int]]
     roof_area_m2: float
     total_waste_pct: float
     trims: dict
 
-# ==========================================
-# AUTO-OUTLINE ENDPOINT (NEW)
-# ==========================================
 @app.get("/get-footprint")
 async def get_footprint(lat: float = Query(...), lng: float = Query(...)):
-    # Create a small bounding box (approx 50m x 50m) around the tapped point
-    delta = 0.0005
-    bbox = {
-        "type": "FeatureCollection",
-        "features": [{
-            "type": "Feature",
-            "properties": {},
-            "geometry": {
-                "type": "Polygon",
-                "coordinates": [[
-                    [lng - delta, lat - delta],
-                    [lng + delta, lat - delta],
-                    [lng + delta, lat + delta],
-                    [lng - delta, lat + delta],
-                    [lng - delta, lat - delta]
-                ]]
-            }
-        }]
-    }
-    
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.geojson', delete=False) as f:
-        json.dump(bbox, f)
-        input_path = f.name
-        
-    output_path = input_path.replace('.geojson', '_out.geojson')
-    
+    query = f"[out:json];way(around:30,{lat},{lng})['building'];out geom;"
     try:
-        download_buildings(
-            source="google",
-            input_path=input_path,
-            output_path=output_path,
-            format="geojson"
-        )
+        res = requests.post("https://overpass-api.de/api/interpreter", data={"data": query}, timeout=10)
+        data = res.json()
         
-        with open(output_path, 'r') as f:
-            data = json.load(f)
+        if not data.get('elements'): return {"error": "No building found at this location in OpenStreetMap."}
             
-        pt = Point(lng, lat)
-        for feature in data.get('features', []):
-            poly = shape(feature['geometry'])
-            if poly.contains(pt):
-                # Convert to Leaflet's {lat, lng} format
-                coords = list(poly.exterior.coords)
-                leaflet_coords = [{"lat": c[1], "lng": c[0]} for c in coords]
-                return {"polygon": leaflet_coords}
-                
-        return {"error": "No building found at this location."}
+        closest_poly = None
+        min_dist = float('inf')
+        for element in data['elements']:
+            coords = [(node['lat'], node['lon']) for node in element.get('geometry', [])]
+            if len(coords) >= 3:
+                poly = sg.Polygon(coords)
+                pt = sg.Point(lat, lng)
+                dist = poly.distance(pt)
+                if dist < min_dist:
+                    min_dist = dist
+                    closest_poly = coords
+                    
+        if closest_poly:
+            return {"polygon": [{"lat": c[0], "lng": c[1]} for c in closest_poly]}
+        return {"error": "No valid building geometry found."}
     except Exception as e:
-        return {"error": str(e)}
-    finally:
-        if os.path.exists(input_path): os.remove(input_path)
-        if os.path.exists(output_path): os.remove(output_path)
+        return {"error": f"Failed to fetch footprint: {str(e)}"}
 
-# ==========================================
-# ROOF ENGINE CLASS
-# ==========================================
 class RoofEngine:
     def __init__(self, exterior_2d, interiors_2d=None, pitch_deg=30.0, sheet_width_mm=760.0, max_stock_mm=12000.0, overhang_mm=150.0):
         self.ext_2d = self._ensure_ccw(self._clean_ring(exterior_2d))
+        
+        poly = sg.Polygon(self.ext_2d)
+        if not poly.is_valid:
+            poly = poly.buffer(0)
+            if poly.geom_type == 'Polygon':
+                self.ext_2d = list(poly.exterior.coords)[:-1]
+            elif poly.geom_type == 'MultiPolygon':
+                largest = max(poly.geoms, key=lambda p: p.area)
+                self.ext_2d = list(largest.exterior.coords)[:-1]
+
         self.int_2d_list = []
         if interiors_2d:
             for interior in interiors_2d:
@@ -156,7 +130,7 @@ class RoofEngine:
         try:
             mesh, lines_3d = extrude(compas_poly, holes=holes, angles=angles)
         except Exception as e:
-            raise ValueError(f"CGAL Skeleton generation failed: {e}")
+            raise ValueError(f"CGAL_SKELETON_FAILED")
 
         verts_raw, faces_raw = mesh.to_vertices_and_faces()
         mesh_verts = [list(v) for v in verts_raw]
@@ -190,7 +164,7 @@ class RoofEngine:
                 boundary_lines.append(sg.LineString([coords[i], coords[i+1]]))
 
         self.faces_2d = list(shapely.ops.polygonize(shapely.ops.unary_union(skeleton_lines + boundary_lines)))
-        if not self.faces_2d: raise ValueError("Polygonization failed.")
+        if not self.faces_2d: raise ValueError("POLYGONIZATION_FAILED")
 
         for face in self.faces_2d:
             coords = list(face.exterior.coords)[:-1]
@@ -257,30 +231,38 @@ class RoofEngine:
         slope_factor = 1.0 / math.cos(self.pitch_rad)
         roof_area_m2 = plan_area * slope_factor
 
-        ridge_len, hip_len, valley_len, eave_len = 0, 0, 0, 0
+        hip_count = len(self.faces_2d)
+        ridge_count = 1 if len(self.faces_2d) > 2 else 0
+        
         perimeter = footprint_poly.length
         eave_len = perimeter + (len(footprint_poly.exterior.coords) * 0.05)
         
         minx, miny, maxx, maxy = footprint_poly.bounds
         width, length = maxx - minx, maxy - miny
-        ridge_len = max(0, length - width) * 1.05
-        hip_len = len(self.faces_2d) * ((width/2) + 0.05) * 1.528 
+        ridge_len = max(0, length - width) * 1.05 if ridge_count > 0 else 0
+        
+        # FIX D1: Accurate hip length based on pitch
+        hip_factor = math.sqrt(2) / math.cos(self.pitch_rad)
+        hip_avg_len = (width/2 + 0.05) * hip_factor
+        hip_len = hip_count * hip_avg_len
         
         trims = {
             "hip_capping_m": round(hip_len, 1),
+            "hip_count": hip_count,
             "ridge_capping_m": round(ridge_len, 1),
+            "ridge_count": ridge_count,
             "valley_capping_m": 0.0, 
             "eaves_gutter_m": round(eave_len, 1)
         }
         
-        summary = f"Total Sheets: {total_sheets}\nTotal 12m Coils: {len(stock)}\nLinear Meters Used: {total_used:.2f}m\nRoof Area: {roof_area_m2:.1f} m²\nWaste: {waste_pct:.1f}%"
+        summary = f"Total Sheets: {total_sheets}\nTotal Coils: {len(stock)}\nLinear Meters Used: {total_used:.2f}m\nRoof Area: {roof_area_m2:.1f} m²\nWaste: {waste_pct:.1f}%"
         
         csv_lines = ["SheetID,Length_mm,CutAngle_Bottom,CutAngle_Top,Stock_Coil"]
         for i, s in enumerate(stock):
             for j, cut in enumerate(s['cuts']):
                 csv_lines.append(f"P{i:02d}{j:02d},{cut['length_mm']},{cut['angle_start']},{cut['angle_end']},Coil_{i+1}")
         
-        return summary, "\n".join(csv_lines), roof_area_m2, waste_pct, trims
+        return summary, "\n".join(csv_lines), roof_area_m2, waste_pct, trims, len(stock), total_stock
 
 @app.post("/calculate", response_model=RoofResponse)
 def calculate_roof(req: RoofRequest):
@@ -289,12 +271,13 @@ def calculate_roof(req: RoofRequest):
         poly, skel, mesh_verts, mesh_faces = engine.run_engine_1_geometry()
         engine.run_engine_2_laydown(poly, skel)
         stock = engine.run_engine_3_nesting()
-        summary, csv_data, area, waste, trims = engine.get_results(stock, poly)
+        summary, csv_data, area, waste, trims, coils, stock_m = engine.get_results(stock, poly)
         
         return RoofResponse(
             summary=summary, csv_data=csv_data, sheets=[SheetData(**s) for s in engine.sheets],
             total_faces=len(engine.faces_2d), mesh_vertices=mesh_verts, mesh_faces=mesh_faces,
-            roof_area_m2=area, total_waste_pct=waste, trims=trims
+            roof_area_m2=area, total_waste_pct=waste, trims=trims,
+            total_coils=coils, total_stock_m=stock_m
         )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
