@@ -5,4 +5,8 @@ numpy
 shapely
 compas
 compas_cgal
-obe
+requests
+ultralytics
+torch
+opencv-python-headless
+Pillow
