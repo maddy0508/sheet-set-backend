@@ -10,7 +10,13 @@ from compas.geometry import Polygon
 from compas_cgal.straight_skeleton_2 import extrude
 
 app = FastAPI(title="Sheet Set API", version="1.0.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 EPS = 1e-6
 
@@ -76,6 +82,7 @@ class RoofEngine:
     def run_engine_1_geometry(self):
         ext_3d = [(x, y, 0.0) for x, y in self.ext_2d]
         ints_3d = [[(x, y, 0.0) for x, y in ring] for ring in self.int_2d_list]
+        
         compas_poly = Polygon(ext_3d)
         angles = math.degrees(self.pitch_rad)
         holes = ints_3d if ints_3d else None
@@ -85,18 +92,22 @@ class RoofEngine:
         except Exception as e:
             raise ValueError(f"CGAL Skeleton generation failed: {e}")
 
-        mesh_verts = [[v.x, v.y, v.z] for v in mesh.vertices]
-        mesh_faces = [list(f) for f in mesh.faces]
+        # FIXED: Use to_vertices_and_faces() to get the iterables
+        verts_raw, faces_raw = mesh.to_vertices_and_faces()
+        mesh_verts = [list(v) for v in verts_raw]
+        mesh_faces = [list(f) for f in faces_raw]
 
         skeleton_lines = [sg.LineString([(l.start[0], l.start[1]), (l.end[0], l.end[1])]) for l in lines_3d]
         shapely_poly = orient(sg.Polygon(self.ext_2d, self.int_2d_list), sign=1.0)
+        
         return shapely_poly, skeleton_lines, mesh_verts, mesh_faces
 
     def _get_cut_angle(self, pt, polygon_coords):
         for i in range(len(polygon_coords) - 1):
             p1, p2 = polygon_coords[i], polygon_coords[i+1]
             if sg.LineString([p1, p2]).distance(sg.Point(pt)) < EPS:
-                dx, dy = p2[0] - p1[0], p2[1] - p1[1]
+                dx = p2[0] - p1[0]
+                dy = p2[1] - p1[1]
                 if dx == 0 and dy == 0: continue
                 return round(90.0 - abs(math.degrees(math.atan2(dx, dy))), 1)
         return 0.0
@@ -139,7 +150,6 @@ class RoofEngine:
             face_stretched = sg.Polygon([(x, y * stretch) for x, y in rotated_coords])
             stretched_poly_coords = list(face_stretched.exterior.coords)
             minx, miny, maxx, maxy = face_stretched.bounds
-            
             x = minx
             while x <= maxx:
                 clipped = face_stretched.intersection(sg.LineString([(x, miny - 1), (x, maxy + 1)]))
@@ -178,31 +188,23 @@ class RoofEngine:
         total_stock = len(stock) * self.max_stock_m
         waste_pct = ((total_stock - total_used) / total_stock) * 100 if total_stock > 0 else 0
         
-        # Text File Math: Roof Area
         plan_area = footprint_poly.area
         slope_factor = 1.0 / math.cos(self.pitch_rad)
         roof_area_m2 = plan_area * slope_factor
 
-        # Text File Math: Trims
         ridge_len, hip_len, valley_len, eave_len = 0, 0, 0, 0
-        
-        # Note: A simplified trim calculation based on mesh edges
-        # In a full version, we'd parse the skeleton edges precisely.
         perimeter = footprint_poly.length
-        eave_len = perimeter + (len(footprint_poly.exterior.coords) * 0.05) # + 50mm gutters
+        eave_len = perimeter + (len(footprint_poly.exterior.coords) * 0.05)
         
-        # Ridge/Hip/Valley approximation from bounding box
         minx, miny, maxx, maxy = footprint_poly.bounds
         width, length = maxx - minx, maxy - miny
-        ridge_len = max(0, length - width) * 1.05 # + 5% laps
-        
-        # Total faces * avg hip length (simplified)
+        ridge_len = max(0, length - width) * 1.05
         hip_len = len(self.faces_2d) * ((width/2) + 0.05) * 1.528 
         
         trims = {
             "hip_capping_m": round(hip_len, 1),
             "ridge_capping_m": round(ridge_len, 1),
-            "valley_capping_m": 0.0, # To be calculated for complex roofs
+            "valley_capping_m": 0.0, 
             "eaves_gutter_m": round(eave_len, 1)
         }
         
