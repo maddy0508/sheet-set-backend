@@ -5,3 +5,4 @@ numpy
 shapely
 compas
 compas_cgal
+obe
